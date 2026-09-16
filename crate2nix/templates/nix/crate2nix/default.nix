@@ -332,6 +332,13 @@ rec {
             };
           }
         );
+        # A crate whose library is an rlib. Its dependents can compile against
+        # its metadata alone; proc-macros and dylibs have to be linked.
+        hasMetadataOnlyBuild =
+          crateConfig:
+          !(crateConfig.procMacro or false)
+          && !(crateConfig.plugin or false)
+          && lib.all (t: t == "lib" || t == "rlib") (crateConfig.type or [ "lib" ]);
         # Memoize built packages so that reappearing packages are only built once.
         builtByPackageIdByPkgs = mkBuiltByPackageIdByPkgs pkgs;
         mkBuiltByPackageIdByPkgs =
@@ -339,10 +346,14 @@ rec {
           let
             self = {
               crates = lib.mapAttrs
-                (
-                  packageId: value: buildByPackageIdForPkgsImpl self pkgs packageId
-                )
+                (packageId: _: buildByPackageIdForPkgsImpl self pkgs packageId false)
                 crateConfigs;
+              # Metadata-only builds (rustc stopped once the rmeta is written)
+              # that libraries compile against instead of waiting for the
+              # full build of their dependencies.
+              metaCrates = lib.mapAttrs
+                (packageId: _: buildByPackageIdForPkgsImpl self pkgs packageId true)
+                (lib.filterAttrs (_: hasMetadataOnlyBuild) crateConfigs);
               target = makeTarget pkgs.stdenv.hostPlatform;
               # Build-time dependency graph (for proc-macros and build
               # dependencies). When not cross-compiling it equals the host
@@ -357,10 +368,20 @@ rec {
           in
           self;
         buildByPackageIdForPkgsImpl =
-          self: pkgs: packageId:
+          self: pkgs: packageId: metadataOnly:
           let
             features = mergedFeatures."${packageId}" or [ ];
             crateConfig' = crateConfigs."${packageId}";
+            # Only a build that produces nothing but an rlib can compile
+            # against metadata-only dependencies; binaries and the test
+            # build of the root crate link, so they get full builds.
+            compilesOnly =
+              metadataOnly
+              || (
+                hasMetadataOnlyBuild crateConfig'
+                && (crateConfig'.crateBin or [ ]) == [ ]
+                && !(runTests && packageId == rootPackageId)
+              );
             crateConfig = builtins.removeAttrs crateConfig' [
               "resolvedDefaultFeatures"
               "devDependencies"
@@ -380,16 +401,21 @@ rec {
               inherit (self.build) target;
               dependencies = crateConfig.buildDependencies or [ ];
             };
-            dependencies = map
-              (
-                dependency:
-                # proc_macro crates must be compiled for the build architecture
-                if crateConfigs.${dependency.packageId}.procMacro or false then
-                  self.build.crates.${dependency.packageId}
-                else
-                  self.crates.${dependency.packageId}
-              )
-              enabledDependencies;
+            # proc_macro crates must be compiled for the build architecture
+            fullDependency =
+              dependency:
+              if crateConfigs.${dependency.packageId}.procMacro or false then
+                self.build.crates.${dependency.packageId}
+              else
+                self.crates.${dependency.packageId};
+            compileDependency =
+              dependency:
+              if compilesOnly && self.metaCrates ? ${dependency.packageId} then
+                self.metaCrates.${dependency.packageId}
+              else
+                fullDependency dependency;
+            dependencies = map compileDependency enabledDependencies;
+            linkDependencies = map fullDependency enabledDependencies;
             buildDependencies = map
               (dependency: self.build.crates.${dependency.packageId})
               enabledBuildDependencies;
@@ -439,11 +465,13 @@ rec {
               inherit
                 features
                 dependencies
+                linkDependencies
                 buildDependencies
                 crateRenames
                 release
                 ;
             }
+            // lib.optionalAttrs metadataOnly { inherit metadataOnly; }
           );
       in
       builtByPackageIdByPkgs;

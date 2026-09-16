@@ -472,6 +472,12 @@ rec {
                 ;
             }
             // lib.optionalAttrs metadataOnly { inherit metadataOnly; }
+            # The full build of a plain library resumes from the frontend
+            # cache of its metadata-only build instead of repeating the
+            # frontend work.
+            // lib.optionalAttrs (!metadataOnly && compilesOnly && self.metaCrates ? ${packageId}) {
+              resumeFrom = self.metaCrates.${packageId};
+            }
           );
       in
       builtByPackageIdByPkgs;

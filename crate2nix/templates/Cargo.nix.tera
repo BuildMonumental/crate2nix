@@ -191,6 +191,11 @@ rec {
         libPath = {{crate.lib.src_path}};
         {%- endif -%}
 
+        {%- if crate.lib and crate.binaries|length > 0 and crate.is_root_or_workspace_member -%}
+        {#- Lets the library build on its own, apart from the binaries. #}
+        hasLib = true;
+        {%- endif -%}
+
         {%- if not crate.proc_macro -%}
         {#- Omitting []. -#}
         {%- if crate.lib_crate_types|length > 0 -%}

@@ -346,14 +346,21 @@ rec {
           let
             self = {
               crates = lib.mapAttrs
-                (packageId: _: buildByPackageIdForPkgsImpl self pkgs packageId false)
+                (packageId: _: buildByPackageIdForPkgsImpl self pkgs packageId "full")
                 crateConfigs;
               # Metadata-only builds (rustc stopped once the rmeta is written)
               # that libraries compile against instead of waiting for the
               # full build of their dependencies.
               metaCrates = lib.mapAttrs
-                (packageId: _: buildByPackageIdForPkgsImpl self pkgs packageId true)
+                (packageId: _: buildByPackageIdForPkgsImpl self pkgs packageId "meta")
                 (lib.filterAttrs (_: hasMetadataOnlyBuild) crateConfigs);
+              # The library of a package that also has binaries, built on its
+              # own: it compiles against metadata-only dependencies, and the
+              # binaries in `crates` link against it. Dependents link against
+              # it too, as they only need the library.
+              libCrates = lib.mapAttrs
+                (packageId: _: buildByPackageIdForPkgsImpl self pkgs packageId "lib")
+                (lib.filterAttrs (packageId: crateConfig: splitsLib packageId crateConfig) crateConfigs);
               target = makeTarget pkgs.stdenv.hostPlatform;
               # Build-time dependency graph (for proc-macros and build
               # dependencies). When not cross-compiling it equals the host
@@ -367,16 +374,32 @@ rec {
             };
           in
           self;
+        # Whether a package's library gets a derivation of its own (see
+        # `libCrates`). The test build of the root crate stays in one piece.
+        splitsLib =
+          packageId: crateConfig:
+          hasMetadataOnlyBuild crateConfig
+          && (crateConfig.hasLib or false)
+          && (crateConfig.crateBin or [ ]) != [ ]
+          && !(runTests && packageId == rootPackageId);
+        # The build that provides a package's library for linking.
+        libBuild = built: packageId: built.libCrates.${packageId} or built.crates.${packageId};
+        # `mode` is "full" (everything the package builds), "meta" (the
+        # library's rmeta only) or "lib" (the library of a package with
+        # binaries, see `libCrates`).
         buildByPackageIdForPkgsImpl =
-          self: pkgs: packageId: metadataOnly:
+          self: pkgs: packageId: mode:
           let
             features = mergedFeatures."${packageId}" or [ ];
             crateConfig' = crateConfigs."${packageId}";
+            metadataOnly = mode == "meta";
+            prebuiltLib = mode == "full" && self.libCrates ? ${packageId};
             # Only a build that produces nothing but an rlib can compile
             # against metadata-only dependencies; binaries and the test
             # build of the root crate link, so they get full builds.
             compilesOnly =
               metadataOnly
+              || mode == "lib"
               || (
                 hasMetadataOnlyBuild crateConfig'
                 && (crateConfig'.crateBin or [ ]) == [ ]
@@ -385,7 +408,8 @@ rec {
             crateConfig = builtins.removeAttrs crateConfig' [
               "resolvedDefaultFeatures"
               "devDependencies"
-            ];
+              "hasLib"
+            ] // lib.optionalAttrs (mode == "lib") { crateBin = [ ]; };
             devDependencies = lib.optionals (runTests && packageId == rootPackageId) (
               crateConfig'.devDependencies or [ ]
             );
@@ -405,9 +429,9 @@ rec {
             fullDependency =
               dependency:
               if crateConfigs.${dependency.packageId}.procMacro or false then
-                self.build.crates.${dependency.packageId}
+                libBuild self.build dependency.packageId
               else
-                self.crates.${dependency.packageId};
+                libBuild self dependency.packageId;
             compileDependency =
               dependency:
               if compilesOnly && self.metaCrates ? ${dependency.packageId} then
@@ -417,7 +441,7 @@ rec {
             dependencies = map compileDependency enabledDependencies;
             linkDependencies = map fullDependency enabledDependencies;
             buildDependencies = map
-              (dependency: self.build.crates.${dependency.packageId})
+              (dependency: libBuild self.build dependency.packageId)
               enabledBuildDependencies;
             # Order (build dependencies, then normal dependencies) feeds the
             # crateRenames grouping below.
@@ -472,6 +496,7 @@ rec {
                 ;
             }
             // lib.optionalAttrs metadataOnly { inherit metadataOnly; }
+            // lib.optionalAttrs prebuiltLib { prebuiltLib = self.libCrates.${packageId}; }
           );
       in
       builtByPackageIdByPkgs;
